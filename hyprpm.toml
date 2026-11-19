@@ -1,0 +1,10 @@
+[repository]
+name = "hypr-continuous-scrolling"
+authors = ["yurareru"]
+commit_pins = []
+
+[hypr-continuous-scrolling]
+description = "Scrolling layout trackpad swipe that continues into a workspace swipe at the edge"
+authors = ["yurareru"]
+output = "hypr-continuous-scrolling.so"
+build = ["make all"]
