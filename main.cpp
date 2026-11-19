@@ -13,6 +13,9 @@
 #include <hyprland/src/layout/algorithm/Algorithm.hpp>
 #include <hyprland/src/layout/algorithm/tiled/scrolling/ScrollingAlgorithm.hpp>
 #include <hyprland/src/layout/algorithm/tiled/scrolling/ScrollTapeController.hpp>
+#include <hyprland/src/config/values/types/IntValue.hpp>
+#include <hyprland/src/config/values/types/FloatValue.hpp>
+#include <hyprland/src/config/values/types/BoolValue.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -20,17 +23,22 @@
 #include <stdexcept>
 
 namespace {
-    constexpr size_t                    FINGERS         = 3;
     constexpr eTrackpadGestureDirection DIRECTION       = TRACKPAD_GESTURE_DIR_HORIZONTAL;
     constexpr Input::ModifierMask       MODS            = Input::HL_MODIFIER_NONE;
-    constexpr float                     SCALE           = 2.F;
     constexpr bool                      DISABLE_INHIBIT = false;
-    constexpr float                     WORKSPACE_SCALE = 1.F;
-    constexpr bool                      LEFT_IS_FORWARD = true;
+
+    struct SInstalled {
+        size_t fingers = 0;
+        float  scale   = 1.F;
+    };
 
     HANDLE                              g_handle = nullptr;
     CHyprSignalListener                 g_reloadListener;
-    bool                                g_installed = false;
+    std::optional<SInstalled>           g_installed;
+    SP<Config::Values::CIntValue>       g_fingers;
+    SP<Config::Values::CFloatValue>     g_scale;
+    SP<Config::Values::CFloatValue>     g_workspaceScale;
+    SP<Config::Values::CBoolValue>      g_leftIsForward;
     bool                                g_active    = false;
     std::string                         g_status    = "not installed";
     SP<IPC::Socket1::SCommand>          g_command;
@@ -159,18 +167,18 @@ namespace {
             ITrackpadGesture::begin(e);
             g_active = true;
 
-            const bool FORWARD = (e.direction == TRACKPAD_GESTURE_DIR_LEFT) == LEFT_IS_FORWARD;
+            const bool FORWARD = (e.direction == TRACKPAD_GESTURE_DIR_LEFT) == g_leftIsForward->value();
             m_workspace        = (e.direction == TRACKPAD_GESTURE_DIR_LEFT || e.direction == TRACKPAD_GESTURE_DIR_RIGHT) && !hasTiledNeighbor(FORWARD);
 
             if (m_workspace)
-                m_workspaceGesture.begin({.swipe = e.swipe, .pinch = e.pinch, .direction = e.direction, .scale = WORKSPACE_SCALE});
+                m_workspaceGesture.begin({.swipe = e.swipe, .pinch = e.pinch, .direction = e.direction, .scale = sc<float>(g_workspaceScale->value())});
             else
                 m_scrollGesture.begin(e);
         }
 
         void update(const STrackpadGestureUpdate& e) override {
             if (m_workspace)
-                m_workspaceGesture.update({.swipe = e.swipe, .pinch = e.pinch, .direction = e.direction, .scale = WORKSPACE_SCALE});
+                m_workspaceGesture.update({.swipe = e.swipe, .pinch = e.pinch, .direction = e.direction, .scale = sc<float>(g_workspaceScale->value())});
             else {
                 m_scrollGesture.update(e);
                 clampTape();
@@ -181,7 +189,7 @@ namespace {
             g_active = false;
 
             if (m_workspace)
-                m_workspaceGesture.end({.swipe = e.swipe, .pinch = e.pinch, .direction = e.direction, .scale = WORKSPACE_SCALE});
+                m_workspaceGesture.end({.swipe = e.swipe, .pinch = e.pinch, .direction = e.direction, .scale = sc<float>(g_workspaceScale->value())});
             else {
                 m_scrollGesture.end(e);
                 centerTape();
@@ -199,27 +207,25 @@ namespace {
     };
 
     void install() {
-        g_installed = false;
+        g_installed.reset();
 
         if (!g_pTrackpadGestures) {
-            log("trackpad gestures unavailable, leaving config gesture in place");
+            log("trackpad gestures unavailable");
             return;
         }
 
-        if (const auto REMOVED = g_pTrackpadGestures->removeGesture(FINGERS, DIRECTION, MODS, SCALE, DISABLE_INHIBIT); !REMOVED) {
-            log(std::format("no matching config gesture ({}), doing nothing", REMOVED.error()));
-            return;
-        }
+        const size_t FINGERS = sc<size_t>(g_fingers->value());
+        const float  SCALE   = sc<float>(g_scale->value());
+
+        (void)g_pTrackpadGestures->removeGesture(FINGERS, DIRECTION, MODS, SCALE, DISABLE_INHIBIT);
 
         if (const auto ADDED = g_pTrackpadGestures->addGesture(makeUnique<CContinuousScrollGesture>(), FINGERS, DIRECTION, MODS, SCALE, DISABLE_INHIBIT); !ADDED) {
-            log(std::format("could not add gesture ({}), restoring scroll_move", ADDED.error()));
-            if (const auto RESTORED = g_pTrackpadGestures->addGesture(makeUnique<CScrollMoveTrackpadGesture>(), FINGERS, DIRECTION, MODS, SCALE, DISABLE_INHIBIT); !RESTORED)
-                log(std::format("could not restore scroll_move ({})", RESTORED.error()));
+            log(std::format("could not add gesture ({})", ADDED.error()));
             return;
         }
 
-        g_installed = true;
-        log("gesture installed");
+        g_installed = SInstalled{.fingers = FINGERS, .scale = SCALE};
+        log(std::format("gesture installed ({} fingers, scale {})", FINGERS, SCALE));
     }
 
     void safeInstall() {
@@ -243,6 +249,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         HyprlandAPI::addNotification(handle, "[hypr-continuous-scrolling] Version mismatch, plugin not loaded", CHyprColor{1.0, 0.2, 0.2, 1.0}, 5000);
         throw std::runtime_error("[hypr-continuous-scrolling] Version mismatch");
     }
+
+    g_fingers        = makeShared<Config::Values::CIntValue>("plugin:continuous_scrolling:fingers", "Fingers for the swipe", 3, Config::Values::SIntValueOptions{.min = 2, .max = 5});
+    g_scale          = makeShared<Config::Values::CFloatValue>("plugin:continuous_scrolling:scale", "Scroll speed inside a workspace", 1.F, Config::Values::SFloatValueOptions{.min = 0.1F, .max = 10.F});
+    g_workspaceScale = makeShared<Config::Values::CFloatValue>("plugin:continuous_scrolling:workspace_scale", "Swipe speed when switching workspace", 1.F, Config::Values::SFloatValueOptions{.min = 0.1F, .max = 10.F});
+    g_leftIsForward  = makeShared<Config::Values::CBoolValue>("plugin:continuous_scrolling:left_is_forward", "Swiping left moves to the next window", true);
+
+    HyprlandAPI::addConfigValueV2(handle, g_fingers);
+    HyprlandAPI::addConfigValueV2(handle, g_scale);
+    HyprlandAPI::addConfigValueV2(handle, g_workspaceScale);
+    HyprlandAPI::addConfigValueV2(handle, g_leftIsForward);
 
     g_reloadListener = Event::bus()->m_events.config.reloaded.listen([] { safeInstall(); });
 
@@ -271,8 +287,9 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (!g_pTrackpadGestures || !g_installed)
         return;
 
-    if (g_pTrackpadGestures->removeGesture(FINGERS, DIRECTION, MODS, SCALE, DISABLE_INHIBIT))
-        (void)g_pTrackpadGestures->addGesture(makeUnique<CScrollMoveTrackpadGesture>(), FINGERS, DIRECTION, MODS, SCALE, DISABLE_INHIBIT);
+    const auto INSTALLED = *g_installed;
+    if (g_pTrackpadGestures->removeGesture(INSTALLED.fingers, DIRECTION, MODS, INSTALLED.scale, DISABLE_INHIBIT))
+        (void)g_pTrackpadGestures->addGesture(makeUnique<CScrollMoveTrackpadGesture>(), INSTALLED.fingers, DIRECTION, MODS, INSTALLED.scale, DISABLE_INHIBIT);
 
-    g_installed = false;
+    g_installed.reset();
 }
