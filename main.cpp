@@ -78,6 +78,32 @@ namespace {
         return false;
     }
 
+    PHLWINDOW nearestTiledNeighbor(bool forward) {
+        const auto FOCUSED = Desktop::focusState()->window();
+        if (!FOCUSED || FOCUSED->isFloating() || !FOCUSED->m_workspace)
+            return nullptr;
+
+        const double CENTER = FOCUSED->layoutBox().middle().x;
+        PHLWINDOW    best;
+        double       bestDistance = 0.0;
+
+        for (const auto& w : Desktop::windowState()->windows()) {
+            if (!w || w == FOCUSED || !w->mapped() || w->isHidden() || w->isFloating() || w->m_workspace != FOCUSED->m_workspace)
+                continue;
+
+            const double DISTANCE = w->layoutBox().middle().x - CENTER;
+            if (forward ? DISTANCE <= 0.0 : DISTANCE >= 0.0)
+                continue;
+
+            if (!best || std::abs(DISTANCE) < bestDistance) {
+                best         = w;
+                bestDistance = std::abs(DISTANCE);
+            }
+        }
+
+        return best;
+    }
+
     struct STape {
         Layout::Tiled::CScrollingAlgorithm*   layout = nullptr;
         SP<Layout::Tiled::SScrollingData>     data;
@@ -87,7 +113,7 @@ namespace {
         double                                maxOffset = 0.0;
     };
 
-    std::optional<STape> currentTape() {
+    std::optional<STape> currentTape(bool* fits = nullptr) {
         const auto MONITOR = Desktop::focusState()->monitor();
         if (!MONITOR)
             return std::nullopt;
@@ -121,11 +147,19 @@ namespace {
         tape.viewport = tape.usable.w;
 
         const double EXTENT = tape.controller->calculateMaxExtent(tape.usable, false);
+        if (fits)
+            *fits = tape.viewport > 0.0 && EXTENT <= tape.viewport;
         if (tape.viewport <= 0.0 || EXTENT <= tape.viewport)
             return std::nullopt;
 
         tape.maxOffset = EXTENT - tape.viewport;
         return tape;
+    }
+
+    bool tapeFits() {
+        bool fits = false;
+        currentTape(&fits);
+        return fits;
     }
 
     void setTapeOffset(const STape& tape, double offset) {
@@ -167,8 +201,20 @@ namespace {
             ITrackpadGesture::begin(e);
             g_active = true;
 
-            const bool FORWARD = (e.direction == TRACKPAD_GESTURE_DIR_LEFT) == g_leftIsForward->value();
-            m_workspace        = (e.direction == TRACKPAD_GESTURE_DIR_LEFT || e.direction == TRACKPAD_GESTURE_DIR_RIGHT) && !hasTiledNeighbor(FORWARD);
+            const bool FORWARD    = (e.direction == TRACKPAD_GESTURE_DIR_LEFT) == g_leftIsForward->value();
+            const bool HORIZONTAL = e.direction == TRACKPAD_GESTURE_DIR_LEFT || e.direction == TRACKPAD_GESTURE_DIR_RIGHT;
+            m_focusTarget.reset();
+            m_workspace = HORIZONTAL && !hasTiledNeighbor(FORWARD);
+
+            if (HORIZONTAL && !m_workspace && tapeFits()) {
+                if (const auto TARGET = nearestTiledNeighbor(FORWARD))
+                    m_focusTarget = TARGET;
+                else
+                    m_workspace = true;
+            }
+
+            if (m_focusTarget)
+                return;
 
             if (m_workspace)
                 m_workspaceGesture.begin({.swipe = e.swipe, .pinch = e.pinch, .direction = e.direction, .scale = sc<float>(g_workspaceScale->value())});
@@ -177,6 +223,9 @@ namespace {
         }
 
         void update(const STrackpadGestureUpdate& e) override {
+            if (m_focusTarget)
+                return;
+
             if (m_workspace)
                 m_workspaceGesture.update({.swipe = e.swipe, .pinch = e.pinch, .direction = e.direction, .scale = sc<float>(g_workspaceScale->value())});
             else {
@@ -187,6 +236,14 @@ namespace {
 
         void end(const STrackpadGestureEnd& e) override {
             g_active = false;
+
+            if (m_focusTarget) {
+                const auto TARGET = m_focusTarget.lock();
+                m_focusTarget.reset();
+                if (TARGET && !(e.swipe && e.swipe->cancelled))
+                    Desktop::focusState()->fullWindowFocus(TARGET, Desktop::FOCUS_REASON_KEYBIND);
+                return;
+            }
 
             if (m_workspace)
                 m_workspaceGesture.end({.swipe = e.swipe, .pinch = e.pinch, .direction = e.direction, .scale = sc<float>(g_workspaceScale->value())});
@@ -202,6 +259,7 @@ namespace {
 
       private:
         bool                       m_workspace = false;
+        PHLWINDOWREF               m_focusTarget;
         CScrollMoveTrackpadGesture m_scrollGesture;
         CWorkspaceSwipeGesture     m_workspaceGesture;
     };
